@@ -74,3 +74,8 @@ node_modules/
 # Compiled files
 *.pyc
 *.pyo
+
+# Sample Excel files (too large for GitHub)
+Files/
+*.xlsx
+azure.xlsx
