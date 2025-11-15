@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "mongodb-azure-analytics": {
+      "command": "/Users/davisgeorge/Documents/Claude/infra/mcp_server/venv/bin/python3",
+      "args": ["/Users/davisgeorge/Documents/Claude/infra/mcp_server/mongodb_mcp_server.py"],
+      "env": {
+        "MONGODB_URI": "mongodb://localhost:27017/",
+        "MONGODB_DATABASE": "azure",
+        "MONGODB_COLLECTION": "resources"
+      }
+    }
+  }
+}
