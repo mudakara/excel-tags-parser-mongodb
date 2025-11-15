@@ -1,5 +1,5 @@
 """
-Tag parsing module for extracting Application Name, Environment, and Owner from Tags column
+Tag parsing module for dynamically extracting ALL key-value pairs from Tags column
 """
 import pandas as pd
 import re
@@ -18,42 +18,83 @@ logger = logging.getLogger(__name__)
 KEY_VALUE_PATTERN = re.compile(r'([^:,;|]+):([^:,;|]+)')
 
 
+def format_column_name(key: str) -> str:
+    """
+    Format a tag key into a proper column name.
+
+    Examples:
+        'primarycontact' -> 'Primary Contact'
+        'application_name' -> 'Application Name'
+        'costcenter' -> 'Cost Center'
+
+    Args:
+        key: The raw key from tags
+
+    Returns:
+        Formatted column name
+    """
+    # Replace underscores with spaces
+    key = key.replace('_', ' ')
+
+    # Handle common abbreviations and special cases
+    special_cases = {
+        'applicationname': 'Application Name',
+        'application name': 'Application Name',
+        'env': 'Environment',
+        'environment': 'Environment',
+        'owner': 'Owner',
+        'cost': 'Cost',
+        'primarycontact': 'Primary Contact',
+        'primary contact': 'Primary Contact',
+        'usage': 'Usage',
+        'costcenter': 'Cost Center',
+        'cost center': 'Cost Center',
+        'businessunit': 'Business Unit',
+        'business unit': 'Business Unit',
+        'department': 'Department',
+        'project': 'Project',
+        'team': 'Team',
+    }
+
+    key_lower = key.lower().strip()
+
+    # Check special cases first
+    if key_lower in special_cases:
+        return special_cases[key_lower]
+
+    # Title case for everything else
+    return key.strip().title()
+
+
 def parse_tags(tag_string: Any) -> Dict[str, str]:
     """
-    Parse tags column and extract application, environment, owner, and cost information.
+    Parse tags column and dynamically extract ALL key-value pairs.
+
+    This function extracts ALL fields found in the tags, not just predefined ones.
+    Each key becomes a column name (properly formatted) and the value becomes the cell value.
 
     Supports multiple tag formats:
-    1. Escaped JSON: "\"owner\":\"data\",\"environment\":\"production\",\"applicationname\":\"arcesb\",\"cost\":\"1000\""
-    2. Key-value pairs: "applicationname:myapp,environment:prod,owner:john,cost:500"
-    3. JSON format: '{"applicationname": "myapp", "environment": "prod", "owner": "john", "cost": "1000"}'
-    4. Pipe-separated values (ordered): "myapp|prod|john|1000"
-
-    STRICT FIELD MATCHING:
-    - Application Name: Only from "applicationname" or "application_name" (not "app" or "application")
-    - Environment: Only from "environment" (not "env")
-    - Owner: Only from "owner"
-    - Cost: Only from "cost"
+    1. Escaped JSON: "\"owner\":\"data\",\"environment\":\"production\",\"primarycontact\":\"john doe\""
+    2. Key-value pairs: "applicationname:myapp,environment:prod,owner:john,usage:databricks"
+    3. JSON format: '{"applicationname": "myapp", "environment": "prod", "owner": "john"}'
+    4. Pipe-separated values: "myapp|prod|john" (limited support - uses predefined field order)
 
     Args:
         tag_string: The tag string to parse (from Tags column)
 
     Returns:
-        Dictionary with keys: 'Application Name', 'Environment', 'Owner', 'Cost'
-        Returns None for each key if not found
+        Dictionary with ALL key-value pairs found
+        Keys are formatted as proper column names (e.g., 'Primary Contact')
+        Returns empty dict if parsing fails or no data found
 
     Examples:
-        >>> parse_tags('"owner":"data","environment":"production","applicationname":"arcesb","cost":"1000"')
-        {'Application Name': 'arcesb', 'Environment': 'production', 'Owner': 'data', 'Cost': '1000'}
+        >>> parse_tags('"owner":"data","primarycontact":"john doe"')
+        {'Owner': 'data', 'Primary Contact': 'john doe'}
 
-        >>> parse_tags("myapp|production|john|1000")
-        {'Application Name': 'myapp', 'Environment': 'production', 'Owner': 'john', 'Cost': '1000'}
+        >>> parse_tags("applicationname:myapp,usage:databricks prod")
+        {'Application Name': 'myapp', 'Usage': 'databricks prod'}
     """
-    result = {
-        'Application Name': None,
-        'Environment': None,
-        'Owner': None,
-        'Cost': None
-    }
+    result = {}
 
     # Handle empty or NaN values
     if pd.isna(tag_string) or tag_string is None:
@@ -79,19 +120,19 @@ def parse_tags(tag_string: Any) -> Dict[str, str]:
         if (tag_string.startswith('{') and tag_string.endswith('}')) or ('"' in tag_string and ':' in tag_string):
             # Try to parse as JSON
             result = _parse_json_format(tag_string)
-            # If JSON parsing didn't extract anything, try other methods
-            if result['Application Name'] is None and result['Environment'] is None and result['Owner'] is None and result['Cost'] is None:
+            # If JSON parsing didn't extract anything, try escaped key-value format
+            if not result:
                 result = _parse_escaped_key_value_format(tag_string)
 
         # Strategy 2: Key-value pairs (most common format)
         elif ':' in tag_string:
             result = _parse_key_value_format(tag_string)
 
-        # Strategy 3: Pipe-separated ordered values
+        # Strategy 3: Pipe-separated ordered values (limited - uses predefined fields)
         elif '|' in tag_string:
             result = _parse_pipe_separated_format(tag_string)
 
-        # Strategy 4: Custom pattern matching (can be extended)
+        # Strategy 4: No recognizable format
         else:
             logger.debug(f"No matching format for tag: {tag_string}")
 
@@ -103,16 +144,14 @@ def parse_tags(tag_string: Any) -> Dict[str, str]:
 
 def _parse_escaped_key_value_format(tag_string: str) -> Dict[str, str]:
     """
-    Parse escaped JSON key-value format tags.
+    Parse escaped JSON key-value format tags and extract ALL key-value pairs.
 
-    Format: "owner":"data","environment":"production","applicationname":"arcesb","cost":"1000"
+    Format: "owner":"data","environment":"production","primarycontact":"john doe","usage":"databricks"
+
+    Returns:
+        Dictionary with ALL key-value pairs found, with formatted column names
     """
-    result = {
-        'Application Name': None,
-        'Environment': None,
-        'Owner': None,
-        'Cost': None
-    }
+    result = {}
 
     # Use regex to extract quoted key-value pairs
     # Pattern: "key":"value"
@@ -120,37 +159,31 @@ def _parse_escaped_key_value_format(tag_string: str) -> Dict[str, str]:
     matches = re.findall(pattern, tag_string)
 
     for key, value in matches:
-        key_lower = key.strip().lower()
+        key_raw = key.strip()
         value_clean = value.strip()
 
-        # Map key names to standard fields - STRICT matching for applicationname only
-        if key_lower in ['applicationname', 'application_name']:
-            result['Application Name'] = value_clean
-        elif key_lower in ['environment']:
-            result['Environment'] = value_clean
-        elif key_lower in ['owner']:
-            result['Owner'] = value_clean
-        elif key_lower in ['cost']:
-            result['Cost'] = value_clean
+        # Format the key into a proper column name
+        column_name = format_column_name(key_raw)
+
+        # Store the value
+        result[column_name] = value_clean
 
     return result
 
 
 def _parse_key_value_format(tag_string: str) -> Dict[str, str]:
     """
-    Parse key-value format tags.
+    Parse key-value format tags and extract ALL key-value pairs.
 
-    Formats: "applicationname:myapp,environment:prod,owner:john,cost:500"
+    Formats: "applicationname:myapp,environment:prod,owner:john,usage:databricks,primarycontact:john doe"
+
+    Returns:
+        Dictionary with ALL key-value pairs found, with formatted column names
     """
-    result = {
-        'Application Name': None,
-        'Environment': None,
-        'Owner': None,
-        'Cost': None
-    }
+    result = {}
 
     # Split by common separators
-    pairs = re.split(r'[,;|]', tag_string)
+    pairs = re.split(r'[,;]', tag_string)
 
     for pair in pairs:
         pair = pair.strip()
@@ -159,22 +192,18 @@ def _parse_key_value_format(tag_string: str) -> Dict[str, str]:
 
         try:
             key, value = pair.split(':', 1)
-            key = key.strip().lower()
+            key_raw = key.strip()
             value = value.strip()
 
             # Remove surrounding quotes if present
             if value.startswith('"') and value.endswith('"'):
                 value = value[1:-1]
 
-            # Map key names to standard fields - STRICT matching for applicationname only
-            if key in ['applicationname', 'application_name']:
-                result['Application Name'] = value
-            elif key in ['environment']:
-                result['Environment'] = value
-            elif key in ['owner']:
-                result['Owner'] = value
-            elif key in ['cost']:
-                result['Cost'] = value
+            # Format the key into a proper column name
+            column_name = format_column_name(key_raw)
+
+            # Store the value
+            result[column_name] = value
 
         except ValueError:
             continue
@@ -212,35 +241,31 @@ def _parse_pipe_separated_format(tag_string: str) -> Dict[str, str]:
 
 def _parse_json_format(tag_string: str) -> Dict[str, str]:
     """
-    Parse JSON-like format tags.
+    Parse JSON-like format tags and extract ALL key-value pairs.
 
-    Format: '{"applicationname": "myapp", "environment": "prod", "owner": "john", "cost": "1000"}'
+    Format: '{"applicationname": "myapp", "environment": "prod", "owner": "john", "usage": "databricks"}'
+
+    Returns:
+        Dictionary with ALL key-value pairs found, with formatted column names
     """
     import json
 
-    result = {
-        'Application Name': None,
-        'Environment': None,
-        'Owner': None,
-        'Cost': None
-    }
+    result = {}
 
     try:
         # Try to parse as proper JSON first
         if tag_string.startswith('{') and tag_string.endswith('}'):
             data = json.loads(tag_string)
 
-            # Map JSON keys to standard fields - STRICT matching for applicationname only
+            # Extract ALL key-value pairs
             for key, value in data.items():
-                key_lower = key.lower()
-                if key_lower in ['applicationname', 'application_name']:
-                    result['Application Name'] = str(value)
-                elif key_lower in ['environment']:
-                    result['Environment'] = str(value)
-                elif key_lower in ['owner']:
-                    result['Owner'] = str(value)
-                elif key_lower in ['cost']:
-                    result['Cost'] = str(value)
+                key_raw = key.strip()
+
+                # Format the key into a proper column name
+                column_name = format_column_name(key_raw)
+
+                # Store the value as string
+                result[column_name] = str(value)
         else:
             # Not proper JSON, try escaped key-value format
             result = _parse_escaped_key_value_format(tag_string)
@@ -255,7 +280,9 @@ def _parse_json_format(tag_string: str) -> Dict[str, str]:
 
 def process_dataframe(df: pd.DataFrame, tag_column: str = None, date_value: str = None) -> pd.DataFrame:
     """
-    Process a DataFrame by parsing the Tags column and adding new columns.
+    Process a DataFrame by parsing the Tags column and dynamically adding ALL extracted columns.
+
+    This function extracts ALL key-value pairs from the tags and creates a column for each unique key.
 
     Args:
         df: Input DataFrame
@@ -263,7 +290,11 @@ def process_dataframe(df: pd.DataFrame, tag_column: str = None, date_value: str 
         date_value: Date string (YYYY-MM format) to add to all rows
 
     Returns:
-        DataFrame with four new columns added: Application Name, Environment, Owner, Date
+        DataFrame with dynamically added columns based on tags content + Date column
+
+    Example:
+        If tags contain ["primarycontact":"john", "usage":"databricks"],
+        the result will have columns: "Primary Contact", "Usage", "Date"
     """
     if tag_column is None:
         tag_column = config.TAG_COLUMN
@@ -278,37 +309,34 @@ def process_dataframe(df: pd.DataFrame, tag_column: str = None, date_value: str 
     parsed_data = df[tag_column].apply(parse_tags)
 
     # Convert list of dictionaries to DataFrame
+    # This will automatically create columns for ALL unique keys found
     parsed_df = pd.DataFrame(parsed_data.tolist())
 
     # Add Date column with the extracted date value
     parsed_df['Date'] = date_value
 
-    # Remove Cost column from parsed_df if it exists in the original df
-    # We want to use the actual Cost column from Excel, not from tags parsing
-    if 'Cost' in df.columns and 'Cost' in parsed_df.columns:
-        logger.info("Cost column exists in both original data and parsed tags - using original data")
-        parsed_df = parsed_df.drop(columns=['Cost'])
-
-    # Check for any other duplicate columns and drop them from parsed_df
+    # Check for duplicate columns and drop them from parsed_df
+    # We want to keep the original Excel columns, not the parsed ones if they conflict
     duplicate_cols = [col for col in parsed_df.columns if col in df.columns and col != tag_column]
     if duplicate_cols:
-        logger.warning(f"Dropping duplicate columns from parsed data: {duplicate_cols}")
+        logger.warning(f"Dropping duplicate columns from parsed data (keeping original): {duplicate_cols}")
         parsed_df = parsed_df.drop(columns=duplicate_cols)
 
     # Add new columns to original DataFrame
     result_df = pd.concat([df, parsed_df], axis=1)
 
-    # Log statistics
-    app_count = int(parsed_df['Application Name'].notna().sum()) if 'Application Name' in parsed_df.columns else 0
-    env_count = int(parsed_df['Environment'].notna().sum()) if 'Environment' in parsed_df.columns else 0
-    owner_count = int(parsed_df['Owner'].notna().sum()) if 'Owner' in parsed_df.columns else 0
+    # Log statistics about the parsed columns
+    parsed_columns = [col for col in parsed_df.columns if col != 'Date']
+    logger.info(f"Created {len(parsed_columns)} new columns from tags: {parsed_columns}")
 
-    # Check if Cost column exists in the final result (original df has it)
-    if 'Cost' in result_df.columns:
-        cost_count = int(result_df['Cost'].notna().sum())
-    else:
-        cost_count = 0
+    # Count non-null values for each parsed column
+    for col in parsed_columns:
+        count = int(parsed_df[col].notna().sum())
+        if count > 0:
+            logger.info(f"  - {col}: {count} rows with data")
 
-    logger.info(f"Parsed results - Application Name: {app_count}, Environment: {env_count}, Owner: {owner_count}, Cost: {cost_count}, Date: {date_value}")
+    # Log date info
+    if date_value:
+        logger.info(f"Added Date column with value: {date_value}")
 
     return result_df
