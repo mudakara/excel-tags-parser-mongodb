@@ -1,10 +1,10 @@
 """
-MongoDB operations module for data insertion and querying
+MongoDB operations module for data insertion and querying with progress tracking
 """
 import pandas as pd
 from pymongo.collection import Collection
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Callable, Optional
 import logging
 import sys
 import os
@@ -17,22 +17,54 @@ from src.database.mongodb_client import get_collection
 logger = logging.getLogger(__name__)
 
 
+def to_camel_case(column_name: str) -> str:
+    """
+    Convert a column name to camelCase for MongoDB field names.
+
+    Examples:
+        'Primary Contact' -> 'primaryContact'
+        'Cost Center' -> 'costCenter'
+        'Application Name' -> 'applicationName'
+
+    Args:
+        column_name: Column name to convert
+
+    Returns:
+        camelCase version of the column name
+    """
+    # Split by spaces
+    words = column_name.split()
+    if not words:
+        return column_name
+
+    # First word lowercase, rest title case, remove spaces
+    camel = words[0].lower() + ''.join(word.capitalize() for word in words[1:])
+    return camel
+
+
 def prepare_document(row: pd.Series, source_file: str = None) -> Dict[str, Any]:
     """
-    Prepare a single document for MongoDB insertion.
+    Prepare a single document for MongoDB insertion with dynamic field extraction.
 
     Schema design optimized for dashboards and analytics:
-    - All original Excel columns preserved
-    - Extracted fields: applicationName, environment, owner
-    - Metadata: importDate, sourceFile
-    - Clean data: NaN converted to None
+    - All original Excel columns preserved in 'originalData'
+    - Standard fields: applicationName, environment, owner, cost, date
+    - ALL dynamically parsed tag fields added at top level (e.g., primaryContact, usage, etc.)
+    - Metadata: importDate, sourceFile, importTimestamp
+    - Clean data: NaN converted to None, timestamps converted to ISO format
+
+    Dynamic Fields:
+    - Any column NOT in the original Excel (extracted from tags) is added as a top-level field
+    - Field names are converted to camelCase (e.g., 'Primary Contact' -> 'primaryContact')
+    - Only non-null values are included
+    - All dynamic fields are also stored in 'tags.parsed' for reference
 
     Args:
         row: DataFrame row as Series
         source_file: Name of the source Excel file
 
     Returns:
-        Dictionary ready for MongoDB insertion
+        Dictionary ready for MongoDB insertion with all dynamic fields
     """
     # Convert row to dictionary and replace NaN with None
     doc = row.to_dict()
@@ -65,9 +97,43 @@ def prepare_document(row: pd.Series, source_file: str = None) -> Dict[str, Any]:
         elif isinstance(value, (pd.Timestamp, datetime)):
             doc[key] = value.isoformat()
 
+    # Define known columns that should not be treated as dynamically parsed fields
+    # These are columns from the original Excel file or system columns
+    SYSTEM_COLUMNS = {
+        'Tags',  # Original tags column
+        'Date',  # Added by our processor
+        config.TAG_COLUMN if hasattr(config, 'TAG_COLUMN') else 'Tags',
+    }
+
+    # Also try to identify cost columns (they might be in original Excel)
+    COST_COLUMN_NAMES = ['Cost', 'CostUSD', 'cost', 'COST', 'PreTaxCost', 'CostInBillingCurrency']
+
+    # Extract all dynamically parsed fields (columns that are NOT system columns)
+    # These are the fields extracted from tags by the dynamic parser
+    dynamic_fields = {}
+    parsed_fields = {}
+
+    for column, value in doc.items():
+        # Skip if it's a system column
+        if column in SYSTEM_COLUMNS or column in COST_COLUMN_NAMES:
+            continue
+
+        # Skip if value is None (NaN was converted to None)
+        if value is None:
+            continue
+
+        # This is a dynamically parsed field - add it
+        field_name = to_camel_case(column)
+        dynamic_fields[field_name] = value
+        parsed_fields[field_name] = value
+
+    # Log the dynamic fields being added
+    if dynamic_fields:
+        logger.debug(f"Adding {len(dynamic_fields)} dynamic fields: {list(dynamic_fields.keys())}")
+
     # Restructure for better querying and dashboard creation
     structured_doc = {
-        # Extracted fields (for easy filtering/grouping in dashboards)
+        # Standard extracted fields (for easy filtering/grouping in dashboards)
         'applicationName': doc.get('Application Name'),
         'environment': doc.get('Environment'),
         'owner': doc.get('Owner'),
@@ -77,11 +143,7 @@ def prepare_document(row: pd.Series, source_file: str = None) -> Dict[str, Any]:
         # Tags information
         'tags': {
             'raw': doc.get('Tags'),
-            'parsed': {
-                'applicationName': doc.get('Application Name'),
-                'environment': doc.get('Environment'),
-                'owner': doc.get('Owner')
-            }
+            'parsed': parsed_fields  # All dynamically extracted fields
         },
 
         # All original data from Excel (preserves all columns)
@@ -96,6 +158,10 @@ def prepare_document(row: pd.Series, source_file: str = None) -> Dict[str, Any]:
         }
     }
 
+    # Add all dynamic fields to the top level for easy querying
+    # This makes them searchable/filterable in MongoDB
+    structured_doc.update(dynamic_fields)
+
     return structured_doc
 
 
@@ -103,10 +169,11 @@ def insert_dataframe_to_mongodb(
     df: pd.DataFrame,
     source_file: str = None,
     collection_name: str = None,
-    batch_size: int = 1000
+    batch_size: int = 1000,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None
 ) -> Dict[str, Any]:
     """
-    Insert DataFrame into MongoDB with proper schema design.
+    Insert DataFrame into MongoDB with proper schema design and progress tracking.
 
     The schema is optimized for:
     - Fast querying by applicationName, environment, owner
@@ -119,6 +186,7 @@ def insert_dataframe_to_mongodb(
         source_file: Name of the source Excel file
         collection_name: MongoDB collection name (default from config)
         batch_size: Number of documents to insert per batch
+        progress_callback: Optional callback function(current, total, message) to report progress
 
     Returns:
         Dictionary with insertion statistics
@@ -127,33 +195,68 @@ def insert_dataframe_to_mongodb(
 
     logger.info(f"Preparing to insert {len(df)} documents into MongoDB")
 
-    # Prepare all documents
+    total_docs = len(df)
+    total_batches = (total_docs + batch_size - 1) // batch_size  # Ceiling division
+
+    # Step 1: Prepare all documents
+    if progress_callback:
+        progress_callback(0, total_docs, "Preparing documents for MongoDB...")
+
     documents = []
     for idx, row in df.iterrows():
         doc = prepare_document(row, source_file)
         documents.append(doc)
 
-    # Insert in batches for better performance
+        # Report preparation progress every 1000 documents
+        if progress_callback and (idx + 1) % 1000 == 0:
+            progress_callback(idx + 1, total_docs, f"Prepared {idx + 1:,}/{total_docs:,} documents...")
+
+    if progress_callback:
+        progress_callback(total_docs, total_docs, f"All {total_docs:,} documents prepared!")
+
+    # Step 2: Insert in batches for better performance
     total_inserted = 0
     failed_inserts = 0
+    current_batch_num = 0
 
     try:
         for i in range(0, len(documents), batch_size):
             batch = documents[i:i + batch_size]
+            current_batch_num += 1
 
             try:
+                if progress_callback:
+                    progress_callback(
+                        total_inserted,
+                        total_docs,
+                        f"Inserting batch {current_batch_num}/{total_batches} ({len(batch)} documents)..."
+                    )
+
                 result = collection.insert_many(batch, ordered=False)
                 total_inserted += len(result.inserted_ids)
-                logger.info(f"Inserted batch: {len(result.inserted_ids)} documents")
+                logger.info(f"Inserted batch {current_batch_num}/{total_batches}: {len(result.inserted_ids)} documents")
+
+                if progress_callback:
+                    progress_callback(
+                        total_inserted,
+                        total_docs,
+                        f"Inserted {total_inserted:,}/{total_docs:,} documents..."
+                    )
 
             except Exception as e:
                 failed_inserts += len(batch)
-                logger.error(f"Error inserting batch: {e}")
+                logger.error(f"Error inserting batch {current_batch_num}: {e}")
 
         logger.info(f"Successfully inserted {total_inserted} documents")
 
-        # Create indexes after insertion
+        # Step 3: Create indexes after insertion
+        if progress_callback:
+            progress_callback(total_docs, total_docs, "Creating database indexes...")
+
         create_indexes(collection)
+
+        if progress_callback:
+            progress_callback(total_docs, total_docs, "✅ MongoDB insertion complete!")
 
         return {
             'success': True,

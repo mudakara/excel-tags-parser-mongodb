@@ -161,37 +161,56 @@ All extracted fields are stored in MongoDB with the same dynamic structure:
 
 ```javascript
 {
-  // All extracted fields stored at top level for easy querying
+  // Standard fields (always present if available)
+  "applicationName": "myapp",
+  "environment": "production",
   "owner": "john",
+  "cost": 1234.56,
+  "date": "2025-11",
+
+  // ALL dynamically extracted fields at top level (in camelCase)
+  // These are automatically extracted from tags and added for easy querying
   "primaryContact": "jane",
   "usage": "databricks prod",
   "department": "IT",
   "costCenter": "CC123",
-  // ... any other fields found
-
-  "date": "2025-11",
+  "team": "analytics",
+  "project": "sales",
+  // ... any other fields found in tags across ANY row
 
   // Tags information
   "tags": {
     "raw": "original tag string",
     "parsed": {
-      // All extracted key-value pairs
+      // All extracted key-value pairs (same as top-level dynamic fields)
+      "primaryContact": "jane",
+      "usage": "databricks prod",
+      "department": "IT",
+      "costCenter": "CC123"
+      // ...
     }
   },
 
   // All original Excel data
   "originalData": {
-    // Everything from Excel preserved
+    // Everything from Excel preserved exactly as it was
   },
 
   // Metadata
   "metadata": {
-    "importDate": "2025-11-15T...",
+    "importDate": "2025-11-15T12:34:56.789000",
     "sourceFile": "filename.xlsx",
+    "importTimestamp": "2025-11-15T12:34:56.789000",
     "dataDate": "2025-11"
   }
 }
 ```
+
+**Important Notes:**
+- Column names are converted to camelCase for MongoDB (e.g., "Primary Contact" → "primaryContact")
+- Only non-null values are stored
+- All fields are at the top level for easy querying/filtering
+- The same fields are also in `tags.parsed` for reference
 
 ---
 
